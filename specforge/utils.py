@@ -238,6 +238,159 @@ def create_draft_config_from_target(
     return output_path
 
 
+def generate_mdlm_draft_model_config(
+    target_model_path: str,
+    mask_token_id: int,
+    alpha_scheduler: str = "linear",
+    time_epsilon: float = 1e-3,
+    template_config_path: str = None,
+    cache_dir: str = None,
+):
+    """
+    Auto-generate MDLM draft model config based on target model parameters.
+
+    Args:
+        target_model_path (str): Path to the target model
+        mask_token_id (int): Token ID for masking
+        alpha_scheduler (str): Alpha scheduler type ("linear" or "cosine")
+        time_epsilon (float): Minimum timestep to avoid degenerate values
+        template_config_path (str, optional): Template config file path
+        cache_dir (str, optional): Cache directory
+
+    Returns:
+        dict: Generated MDLM draft model config dictionary
+    """
+    # Get target model config
+    target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
+
+    # If no template specified, use default llama3-8B-eagle3.json as base
+    if template_config_path is None:
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
+        template_config_path = os.path.join(
+            project_root, "configs", "llama3-8B-eagle3.json"
+        )
+
+    # Read template config
+    with open(template_config_path, "r") as f:
+        draft_config = json.load(f)
+
+    # Adjust architecture for MDLM
+    draft_config["architectures"] = ["LlamaMDLMDraftModel"]
+    if hasattr(target_config, "model_type"):
+        draft_config["model_type"] = "llama"
+
+    # Align key parameters from target model
+    param_mappings = {
+        "vocab_size": "vocab_size",
+        "hidden_size": "hidden_size",
+        "num_attention_heads": "num_attention_heads",
+        "num_key_value_heads": "num_key_value_heads",
+        "intermediate_size": "intermediate_size",
+        "max_position_embeddings": "max_position_embeddings",
+        "rms_norm_eps": "rms_norm_eps",
+        "hidden_act": "hidden_act",
+        "bos_token_id": "bos_token_id",
+        "eos_token_id": "eos_token_id",
+        "torch_dtype": "torch_dtype",
+    }
+
+    # Copy parameters from target model to draft config
+    for target_param, draft_param in param_mappings.items():
+        if hasattr(target_config, target_param):
+            value = getattr(target_config, target_param)
+            # Special handling for torch_dtype to make it JSON serializable
+            if target_param == "torch_dtype" and isinstance(value, torch.dtype):
+                value = str(value).replace("torch.", "")
+            draft_config[draft_param] = value
+
+    # MDLM-specific parameters
+    draft_config["mask_token_id"] = mask_token_id
+    draft_config["alpha_scheduler"] = alpha_scheduler
+    draft_config["time_epsilon"] = time_epsilon
+
+    # MDLM uses bidirectional attention, so we can use more layers
+    # But start with 1 layer for simplicity
+    draft_config["num_hidden_layers"] = 1
+
+    # Keep some fixed draft model specific parameters
+    draft_config["tie_word_embeddings"] = False
+    draft_config["use_cache"] = True
+
+    # If template doesn't have draft_vocab_size, set to vocab_size
+    if "draft_vocab_size" not in draft_config:
+        draft_config["draft_vocab_size"] = draft_config.get("vocab_size", 32000)
+
+    return draft_config
+
+
+def create_mdlm_config_from_target(
+    target_model_path: str,
+    mask_token_id: int,
+    alpha_scheduler: str = "linear",
+    time_epsilon: float = 1e-3,
+    output_dir: str = None,
+    template_config_path: str = None,
+    cache_dir: str = None,
+):
+    """
+    Convenient function to create MDLM draft model config file from target model.
+
+    Args:
+        target_model_path (str): Target model path
+        mask_token_id (int): Token ID for masking
+        alpha_scheduler (str): Alpha scheduler type ("linear" or "cosine")
+        time_epsilon (float): Minimum timestep to avoid degenerate values
+        output_dir (str, optional): Output directory, defaults to configs folder
+        template_config_path (str, optional): Template config path
+        cache_dir (str, optional): Cache directory
+
+    Returns:
+        str: Generated config file path
+    """
+    # Generate config
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if rank == 0:
+        print_with_rank(
+            "No MDLM draft model config provided, auto-generating from target model..."
+        )
+        config_dict = generate_mdlm_draft_model_config(
+            target_model_path, mask_token_id, alpha_scheduler, time_epsilon,
+            template_config_path, cache_dir
+        )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Determine output path
+    if output_dir is None:
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
+        output_dir = os.path.join(project_root, "configs")
+
+    # Extract model name from model path
+    model_name = target_model_path.split("/")[-1].lower()
+    output_filename = f"{model_name}-mdlm-auto.json"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Save config
+    if rank == 0:
+        save_draft_model_config(config_dict, output_path)
+        print_with_rank(f"Auto-generated MDLM draft model config saved to: {output_path}")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    return output_path
+
+
 def get_full_optimizer_state(optimizer_state_dict: dict):
     """
     Convert optimizer state dict with DTensor to full tensors for saving
