@@ -245,6 +245,7 @@ def generate_mdlm_draft_model_config(
     time_epsilon: float = 1e-3,
     template_config_path: str = None,
     cache_dir: str = None,
+    trust_remote_code: bool = False,
 ):
     """
     Auto-generate MDLM draft model config based on target model parameters.
@@ -256,12 +257,13 @@ def generate_mdlm_draft_model_config(
         time_epsilon (float): Minimum timestep to avoid degenerate values
         template_config_path (str, optional): Template config file path
         cache_dir (str, optional): Cache directory
+        trust_remote_code (bool): Whether to trust remote code when loading config
 
     Returns:
         dict: Generated MDLM draft model config dictionary
     """
     # Get target model config
-    target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
+    target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
 
     # If no template specified, use default llama3-8B-eagle3.json as base
     if template_config_path is None:
@@ -281,7 +283,8 @@ def generate_mdlm_draft_model_config(
     # Adjust architecture for MDLM
     draft_config["architectures"] = ["LlamaMDLMDraftModel"]
     if hasattr(target_config, "model_type"):
-        draft_config["model_type"] = "llama"
+        # Keep the original model type for proper config loading
+        draft_config["model_type"] = target_config.model_type
 
     # Align key parameters from target model
     param_mappings = {
@@ -335,6 +338,7 @@ def create_mdlm_config_from_target(
     output_dir: str = None,
     template_config_path: str = None,
     cache_dir: str = None,
+    trust_remote_code: bool = False,
 ):
     """
     Convenient function to create MDLM draft model config file from target model.
@@ -347,6 +351,7 @@ def create_mdlm_config_from_target(
         output_dir (str, optional): Output directory, defaults to configs folder
         template_config_path (str, optional): Template config path
         cache_dir (str, optional): Cache directory
+        trust_remote_code (bool): Whether to trust remote code when loading config
 
     Returns:
         str: Generated config file path
@@ -360,7 +365,7 @@ def create_mdlm_config_from_target(
         )
         config_dict = generate_mdlm_draft_model_config(
             target_model_path, mask_token_id, alpha_scheduler, time_epsilon,
-            template_config_path, cache_dir
+            template_config_path, cache_dir, trust_remote_code
         )
 
     if dist.is_initialized():

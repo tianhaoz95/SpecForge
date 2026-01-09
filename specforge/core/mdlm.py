@@ -135,22 +135,22 @@ class MDLMTrainer:
             batch: Batch dictionary with keys:
                 - input_ids: [batch_size, seq_len]
                 - attention_mask: [batch_size, seq_len]
-                - labels: [batch_size, seq_len] (with -100 for ignored positions)
+                - loss_mask: [batch_size, seq_len] (1 for positions to include in loss, 0 to ignore)
 
         Returns:
             Tuple of (loss, metrics_dict)
         """
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
+        loss_mask = batch["loss_mask"]
 
         batch_size, seq_len = input_ids.shape
 
         # 1. Sample timesteps
         timesteps = self.sample_timesteps(batch_size)  # [batch_size]
 
-        # 2. Create maskable mask (where labels != -100)
-        maskable_mask = (labels != -100)  # [batch_size, seq_len]
+        # 2. Create maskable mask (where loss_mask == 1)
+        maskable_mask = (loss_mask == 1)  # [batch_size, seq_len]
 
         # 3. Apply stochastic masking
         noised_input_ids, masked_positions = self.apply_stochastic_masking(
@@ -158,26 +158,29 @@ class MDLMTrainer:
         )
 
         # 4. Forward pass through model
+        # Generate position IDs for proper rotary embeddings
+        device = input_ids.device
+        position_ids = torch.arange(
+            0, seq_len, dtype=torch.long, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
+
         outputs = self.model(
             input_ids=noised_input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         logits = outputs.logits  # [batch_size, seq_len, vocab_size]
 
-        # 5. Optionally shift logits right for causal modeling
-        if self.config.right_shift_logits:
-            logits = logits[..., :-1, :].contiguous()
-            labels = labels[..., 1:].contiguous()
-            masked_positions = masked_positions[..., 1:].contiguous()
-            seq_len = seq_len - 1
+        # 5. For MDLM, target is the original input_ids (no shifting needed)
+        target_ids = input_ids  # [batch_size, seq_len]
 
         # 6. Compute cross-entropy loss
         logits_flat = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, vocab_size]
-        labels_flat = labels.view(-1)  # [batch_size * seq_len]
+        target_flat = target_ids.view(-1)  # [batch_size * seq_len]
 
         token_nll = F.cross_entropy(
             logits_flat,
-            labels_flat,
+            target_flat,
             reduction="none"
         )  # [batch_size * seq_len]
 
@@ -212,9 +215,9 @@ class MDLMTrainer:
             # Accuracy on masked positions
             if masked_tokens > 0:
                 masked_logits = logits[masked_positions]  # [masked_tokens, vocab_size]
-                masked_labels = labels[masked_positions]  # [masked_tokens]
+                masked_targets = target_ids[masked_positions]  # [masked_tokens]
                 masked_preds = masked_logits.argmax(dim=-1)  # [masked_tokens]
-                accuracy = (masked_preds == masked_labels).float().mean().item()
+                accuracy = (masked_preds == masked_targets).float().mean().item()
             else:
                 accuracy = 0.0
 
@@ -244,9 +247,6 @@ class MDLMTrainer:
 
         # Forward pass and loss computation
         loss, metrics = self.compute_loss(batch)
-
-        # Backward pass
-        loss.backward()
 
         # Update step counter
         self.step += 1

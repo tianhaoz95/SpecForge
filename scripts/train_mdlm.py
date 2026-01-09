@@ -6,6 +6,7 @@ This script implements MDLM training by maximally reusing SpecForge's existing
 infrastructure while adapting for diffusion-based training.
 """
 import argparse
+import contextlib
 import math
 import os
 import time
@@ -41,6 +42,7 @@ from specforge.distributed import (
     init_distributed,
 )
 from specforge.modeling.auto import AutoMDLMDraftModel
+from specforge.modeling.draft.qwen3_mdlm import Qwen3MDLMDraftModel  # Import to register the model
 from specforge.modeling.target import (
     Eagle3TargetModel,
     get_eagle3_target_model,
@@ -54,9 +56,7 @@ from specforge.utils import (
     print_on_rank0,
     print_with_rank,
 )
-from specforge.core.mdlm import MDLMTrainer, MDLMConfig, MDLMMetrics
 from specforge.core.schedulers import make_alpha_scheduler
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
 
 
 def parse_args():
@@ -95,6 +95,17 @@ def parse_args():
         type=str,
         default=None,
         help="Directory to download models to"
+    )
+    model_group.add_argument(
+        "--cache-dir",
+        type=str,
+        default="./cache",
+        help="Cache directory for model downloads"
+    )
+    model_group.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Whether to trust remote code when loading models and tokenizers"
     )
 
     # MDLM-specific arguments
@@ -244,6 +255,11 @@ def parse_args():
         default=42,
         help="Random seed"
     )
+    training_group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
 
     # Optimization arguments
     opt_group = parser.add_argument_group("Optimization Arguments")
@@ -296,7 +312,8 @@ def build_mdlm_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Mo
             mask_token_id=args.mask_token_id,
             alpha_scheduler=args.alpha_scheduler,
             time_epsilon=args.time_epsilon,
-            cache_dir=args.model_download_dir,
+            cache_dir=args.cache_dir,
+            trust_remote_code=args.trust_remote_code,
         )
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
@@ -333,11 +350,17 @@ def build_mdlm_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Mo
 
 def build_target_model(args: Namespace) -> Eagle3TargetModel:
     """Build target model (REUSE: identical to Eagle3)."""
+    if args.target_model_backend == "sglang":
+        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    else:
+        target_model_kwargs = {}
     target_model = get_eagle3_target_model(
-        target_model_path=args.target_model_path,
+        pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
-        cache_dir=args.model_download_dir,
-        sglang_args=args,  # Pass SGLang args if using sglang backend
+        torch_dtype=torch.bfloat16,
+        device="cuda",
+        cache_dir=args.cache_dir,
+        **target_model_kwargs,
     )
     return target_model
 
@@ -347,124 +370,317 @@ def build_dataloaders(args: Namespace) -> Tuple[DataLoader, Optional[DataLoader]
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path,
-        cache_dir=args.model_download_dir,
-        trust_remote_code=True,
+        cache_dir=args.cache_dir,
+        trust_remote_code=args.trust_remote_code,
     )
 
     # Ensure pad token exists
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Build training dataset
+    # Build training dataset (REUSE: same pattern as Eagle3)
     print_on_rank0("Building training dataset...")
-    train_dataset = build_eagle3_dataset(
-        data_path=args.train_data_path,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        is_preformatted=args.is_preformatted,
-        max_length=args.max_length,
-        num_proc=args.build_dataset_num_proc,
+    import hashlib
+    from specforge.utils import rank_0_priority
+
+    cache_params_string = (
+        f"{args.train_data_path}-"
+        f"{args.max_length}-"
+        f"{args.chat_template}-"
+        f"{args.target_model_path}"
     )
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    train_raw_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+
+    with rank_0_priority():
+        train_dataset = build_eagle3_dataset(
+            dataset=train_raw_dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
+            is_preformatted=args.is_preformatted,
+            num_proc=args.build_dataset_num_proc,
+        )
 
     # Build evaluation dataset if provided
     eval_dataset = None
     if args.eval_data_path:
         print_on_rank0("Building evaluation dataset...")
-        eval_dataset = build_eagle3_dataset(
-            data_path=args.eval_data_path,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            is_preformatted=args.is_preformatted,
-            max_length=args.max_length,
-            num_proc=args.build_dataset_num_proc,
+        eval_cache_params_string = (
+            f"{args.eval_data_path}-"
+            f"{args.max_length}-"
+            f"{args.chat_template}-"
+            f"{args.target_model_path}"
         )
+        eval_cache_key = hashlib.md5(eval_cache_params_string.encode()).hexdigest()
+        eval_raw_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
 
-    # Generate vocab mapping file
-    vocab_mapping_path = os.path.join(args.output_dir, "vocab_mapping.pt")
-    if dist.get_rank() == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
-        generate_vocab_mapping_file(
-            tokenizer=tokenizer,
-            draft_vocab_size=tokenizer.vocab_size,  # For MDLM, same vocab as target
-            save_path=vocab_mapping_path,
-        )
-    dist.barrier()
+        with rank_0_priority():
+            eval_dataset = build_eagle3_dataset(
+                dataset=eval_raw_dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=eval_cache_key,
+                is_preformatted=args.is_preformatted,
+                num_proc=args.build_dataset_num_proc,
+            )
 
-    # Create distributed dataloaders
-    train_dataloader, eval_dataloader = prepare_dp_dataloaders(
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        batch_size=args.batch_size,
-        dp_group=get_dp_group(),
-        draft_dp_group=get_draft_dp_group(),
+    # Generate vocab mapping file (REUSE: same pattern as Eagle3)
+    vocab_mapping_path = generate_vocab_mapping_file(
+        dataset=train_dataset,
+        target_vocab_size=tokenizer.vocab_size,
+        draft_vocab_size=tokenizer.vocab_size,  # For MDLM, same vocab as target
+        cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+        cache_key=cache_key,
     )
+
+    # Create distributed dataloaders (REUSE: same pattern as Eagle3)
+    train_dataloader = prepare_dp_dataloaders(
+        train_dataset,
+        args.batch_size,
+        num_workers=4,  # Default from Eagle3
+        shuffle=True,
+        process_group=(
+            get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group()
+        ),
+    )
+
+    eval_dataloader = None
+    if eval_dataset is not None:
+        eval_dataloader = prepare_dp_dataloaders(
+            eval_dataset,
+            args.batch_size,
+            num_workers=4,
+            shuffle=False,
+            process_group=(
+                get_draft_dp_group() if args.attention_backend == "usp" else get_dp_group()
+            ),
+        )
 
     return train_dataloader, eval_dataloader
 
 
-def create_mdlm_trainer(
-    model: nn.Module,
+def sample_timesteps(batch_size: int, time_epsilon: float, device: torch.device) -> torch.Tensor:
+    """Sample diffusion timesteps for training."""
+    eps = time_epsilon
+    return eps + (1 - eps) * torch.rand(batch_size, device=device)
+
+
+def apply_stochastic_masking(
+    input_ids: torch.Tensor,
+    timesteps: torch.Tensor,
+    maskable_mask: torch.Tensor,
+    alpha_scheduler,
+    mask_token_id: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply stochastic masking based on timesteps."""
+    batch_size, seq_len = input_ids.shape
+
+    # Compute masking probability from alpha scheduler
+    alpha_vals = alpha_scheduler.alpha(timesteps)  # [batch_size]
+    p_mask = 1.0 - alpha_vals.unsqueeze(1).expand(batch_size, seq_len)  # [batch_size, seq_len]
+
+    # Sample which positions to mask
+    random_vals = torch.rand_like(p_mask, device=device)
+    masked_positions = (random_vals < p_mask) & maskable_mask  # [batch_size, seq_len]
+
+    # Apply masking
+    noised_input_ids = torch.where(
+        masked_positions,
+        mask_token_id,
+        input_ids
+    )
+
+    return noised_input_ids, masked_positions
+
+
+def compute_loss_weights(timesteps: torch.Tensor, seq_len: int, alpha_scheduler, loss_weight_type: str, device: torch.device) -> torch.Tensor:
+    """Compute loss weights based on timesteps."""
+    if loss_weight_type == "scheduler":
+        # Use scheduler-based weighting: w(t) = -α'(t) / (1 - α(t))
+        weights = alpha_scheduler.weight(timesteps)  # [batch_size]
+        return weights.unsqueeze(1).expand(-1, seq_len)  # [batch_size, seq_len]
+    else:
+        # Uniform weighting
+        batch_size = timesteps.size(0)
+        return torch.ones(batch_size, seq_len, device=device)
+
+
+def run_mdlm_forward(
     args: Namespace,
-    total_steps: int,
-) -> MDLMTrainer:
-    """Create MDLM trainer with SpecForge's optimization infrastructure."""
-    # Create MDLM config
-    mdlm_config = MDLMConfig(
-        mask_token_id=args.mask_token_id,
-        alpha_scheduler=args.alpha_scheduler,
-        time_epsilon=args.time_epsilon,
-        loss_weight_type=args.loss_weight_type,
-        loss_norm_type=args.loss_norm_type,
-        max_length=args.max_length,
+    mdlm_model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    alpha_scheduler,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Run MDLM forward pass directly (following Eagle3 pattern)."""
+    # Extract inputs
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    loss_mask = batch["loss_mask"]
+
+    batch_size, seq_len = input_ids.shape
+    device = input_ids.device
+
+    # 1. Sample timesteps
+    timesteps = sample_timesteps(batch_size, args.time_epsilon, device)
+
+    # 2. Create maskable mask (where loss_mask == 1)
+    maskable_mask = (loss_mask == 1)
+
+    # 3. Apply stochastic masking
+    noised_input_ids, masked_positions = apply_stochastic_masking(
+        input_ids, timesteps, maskable_mask, alpha_scheduler, args.mask_token_id, device
     )
 
-    # Create optimizer (REUSE: existing BF16Optimizer)
-    optimizer = BF16Optimizer(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=0.01,
+    # 4. Forward pass through FSDP model directly
+    position_ids = torch.arange(
+        0, seq_len, dtype=torch.long, device=device
+    ).unsqueeze(0).expand(batch_size, -1)
+
+    outputs = mdlm_model(
+        input_ids=noised_input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
     )
+    logits = outputs.logits
 
-    # Create learning rate scheduler (REUSE: existing scheduler)
-    num_warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler = CosineAnnealingWarmupLR(
-        optimizer=optimizer,
-        warmup_steps=num_warmup_steps,
-        total_steps=total_steps,
-        eta_min=args.learning_rate * 0.1,
+    # 5. Compute loss
+    target_ids = input_ids
+    logits_flat = logits.view(-1, logits.size(-1))
+    target_flat = target_ids.view(-1)
+
+    token_nll = torch.nn.functional.cross_entropy(
+        logits_flat, target_flat, reduction="none"
     )
+    token_nll = token_nll.view(batch_size, seq_len)
 
-    # Create alpha scheduler for MDLM
-    alpha_scheduler = make_alpha_scheduler(args.alpha_scheduler)
+    # 6. Apply loss weights and masking
+    loss_weights = compute_loss_weights(timesteps, seq_len, alpha_scheduler, args.loss_weight_type, device)
+    weighted_loss = token_nll * loss_weights * masked_positions.float()
 
-    # Create MDLM trainer
-    trainer = MDLMTrainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        alpha_scheduler=alpha_scheduler,
-        config=mdlm_config,
-    )
+    # 7. Normalize loss
+    if args.loss_norm_type == "token":
+        total_masked = masked_positions.sum().clamp_min(1)
+        loss = weighted_loss.sum() / total_masked
+    elif args.loss_norm_type == "sequence":
+        seq_masked = masked_positions.sum(dim=1, keepdim=True).clamp_min(1)
+        seq_loss = weighted_loss.sum(dim=1, keepdim=True) / seq_masked
+        loss = seq_loss.mean()
+    else:  # "batch"
+        loss = weighted_loss.sum() / batch_size
 
-    return trainer
+    # 8. Compute metrics
+    with torch.no_grad():
+        total_tokens = maskable_mask.sum().item()
+        masked_tokens = masked_positions.sum().item()
+        mask_ratio = masked_tokens / max(total_tokens, 1)
+        avg_timestep = timesteps.mean().item()
+
+        if masked_tokens > 0:
+            masked_logits = logits[masked_positions]
+            masked_targets = target_ids[masked_positions]
+            masked_preds = masked_logits.argmax(dim=-1)
+            accuracy = (masked_preds == masked_targets).float().mean().item()
+        else:
+            accuracy = 0.0
+
+        metrics = {
+            "loss": loss.item(),
+            "nll": token_nll[masked_positions].mean().item() if masked_tokens > 0 else 0.0,
+            "ppl": torch.exp(token_nll[masked_positions]).mean().item() if masked_tokens > 0 else 1.0,
+            "mask_ratio": mask_ratio,
+            "avg_timestep": avg_timestep,
+            "masked_tokens": masked_tokens,
+            "total_tokens": total_tokens,
+            "accuracy": accuracy,
+        }
+
+    return loss, metrics
+
+
+def run_mdlm_backward_and_update(
+    args: Namespace,
+    loss: torch.Tensor,
+    optimizer: BF16Optimizer,
+    global_step: int
+) -> None:
+    """Run backward pass and optimizer update (following Eagle3 pattern exactly)."""
+    # Scale loss for gradient accumulation
+    loss = loss / args.gradient_accumulation_steps
+
+    # Backward pass
+    loss.backward()
+
+    # Update optimizer on accumulation boundary
+    if global_step % args.gradient_accumulation_steps == 0:
+        optimizer.step()
+
+
+class MDLMMetrics:
+    """Simple metrics tracker for MDLM training."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all metrics."""
+        self.total_loss = 0.0
+        self.total_nll = 0.0
+        self.total_ppl = 0.0
+        self.total_mask_ratio = 0.0
+        self.total_timestep = 0.0
+        self.total_accuracy = 0.0
+        self.num_batches = 0
+
+    def update(self, metrics: Dict[str, float]):
+        """Update metrics with batch results."""
+        self.total_loss += metrics["loss"]
+        self.total_nll += metrics["nll"]
+        self.total_ppl += metrics["ppl"]
+        self.total_mask_ratio += metrics["mask_ratio"]
+        self.total_timestep += metrics["avg_timestep"]
+        self.total_accuracy += metrics["accuracy"]
+        self.num_batches += 1
+
+    def compute(self) -> Dict[str, float]:
+        """Compute average metrics."""
+        if self.num_batches == 0:
+            return {}
+
+        return {
+            "loss": self.total_loss / self.num_batches,
+            "nll": self.total_nll / self.num_batches,
+            "ppl": self.total_ppl / self.num_batches,
+            "mask_ratio": self.total_mask_ratio / self.num_batches,
+            "avg_timestep": self.total_timestep / self.num_batches,
+            "accuracy": self.total_accuracy / self.num_batches,
+        }
 
 
 def train_epoch(
-    trainer: MDLMTrainer,
+    args: Namespace,
+    mdlm_model: nn.Module,
+    optimizer: BF16Optimizer,
+    alpha_scheduler,
     dataloader: DataLoader,
     epoch: int,
-    args: Namespace,
     tracker: Optional[Tracker] = None,
-    metrics: Optional[MDLMMetrics] = None,
+    global_step_counter: Optional[List[int]] = None,
 ) -> float:
     """Train one epoch."""
-    trainer.model.train()
+    mdlm_model.train()
 
-    if metrics is None:
-        metrics = MDLMMetrics()
-
+    metrics = MDLMMetrics()
     metrics.reset()
     total_loss = 0.0
+
+    if global_step_counter is None:
+        global_step_counter = [0]
 
     progress_bar = tqdm(
         dataloader,
@@ -478,30 +694,23 @@ def train_epoch(
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].cuda()
 
-        # Training step
-        loss, step_metrics = trainer.training_step(batch)
+        # Forward pass (following Eagle3 pattern)
+        loss, step_metrics = run_mdlm_forward(args, mdlm_model, batch, alpha_scheduler)
 
-        # Scale loss for gradient accumulation
-        loss = loss / args.gradient_accumulation_steps
+        # Backward pass and optimization (following Eagle3 pattern)
+        run_mdlm_backward_and_update(args, loss, optimizer, global_step_counter[0] + 1)
+
+        # Update counters
+        global_step_counter[0] += 1
 
         # Update metrics
         metrics.update(step_metrics)
         total_loss += loss.item()
 
-        # Gradient accumulation and optimization
-        if (step + 1) % args.gradient_accumulation_steps == 0:
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), args.max_grad_norm)
-
-            # Optimizer step
-            trainer.optimizer.step()
-            trainer.scheduler.step()
-            trainer.optimizer.zero_grad()
-
         # Logging
         if step % args.log_interval == 0:
             current_metrics = metrics.compute()
-            lr = trainer.scheduler.get_last_lr()[0]
+            lr = optimizer.scheduler.get_last_lr()[0]
 
             progress_bar.set_postfix({
                 'loss': f"{current_metrics['loss']:.4f}",
@@ -519,26 +728,28 @@ def train_epoch(
                     'train/avg_timestep': current_metrics['avg_timestep'],
                     'train/accuracy': current_metrics['accuracy'],
                     'train/lr': lr,
-                    'train/step': trainer.step,
+                    'train/step': global_step_counter[0],
                     'train/epoch': epoch,
                 }
                 tracker.log(log_data)
 
         # Save checkpoint
         if step % args.save_interval == 0 and step > 0:
-            save_checkpoint(trainer, epoch, step, args)
+            save_checkpoint(mdlm_model, optimizer, epoch, global_step_counter[0], args)
 
     return total_loss / len(dataloader)
 
 
 def evaluate(
-    trainer: MDLMTrainer,
+    args: Namespace,
+    mdlm_model: nn.Module,
+    alpha_scheduler,
     dataloader: DataLoader,
     epoch: int,
     tracker: Optional[Tracker] = None,
 ) -> Dict[str, float]:
     """Evaluate the model."""
-    trainer.model.eval()
+    mdlm_model.eval()
 
     metrics = MDLMMetrics()
     metrics.reset()
@@ -551,7 +762,7 @@ def evaluate(
                     batch[key] = batch[key].cuda()
 
             # Validation step
-            loss, step_metrics = trainer.validation_step(batch)
+            loss, step_metrics = run_mdlm_forward(args, mdlm_model, batch, alpha_scheduler)
             metrics.update(step_metrics)
 
     # Compute final metrics
@@ -570,22 +781,21 @@ def evaluate(
     return eval_metrics
 
 
-def save_checkpoint(trainer: MDLMTrainer, epoch: int, step: int, args: Namespace):
+def save_checkpoint(model: nn.Module, optimizer: BF16Optimizer, epoch: int, step: int, args: Namespace):
     """Save model checkpoint."""
     if dist.get_rank() == 0:
         checkpoint_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Save model
-        trainer.model.save_pretrained(checkpoint_dir)
+        model.save_pretrained(checkpoint_dir)
 
         # Save training state
         torch.save({
             'epoch': epoch,
             'step': step,
-            'optimizer_state_dict': trainer.optimizer.state_dict(),
-            'scheduler_state_dict': trainer.scheduler.state_dict(),
-            'alpha_scheduler_name': trainer.alpha_scheduler.__class__.__name__,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': optimizer.scheduler.state_dict(),
         }, os.path.join(checkpoint_dir, 'training_state.pt'))
 
         print_on_rank0(f"Checkpoint saved to {checkpoint_dir}")
@@ -622,49 +832,121 @@ def main():
     print_on_rank0("Building dataloaders...")
     train_dataloader, eval_dataloader = build_dataloaders(args)
 
-    # Wrap model with FSDP (REUSE: existing FSDP setup)
-    mixed_precision_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-
-    draft_model = FSDP(
-        draft_model,
-        mixed_precision=mixed_precision_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        device_id=torch.cuda.current_device(),
-        use_orig_params=True,
-    )
-
     # Calculate total training steps
     total_steps = len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps
 
-    # Create MDLM trainer (NEW: MDLM-specific trainer but reusing optimization infrastructure)
-    print_on_rank0("Creating MDLM trainer...")
-    trainer = create_mdlm_trainer(draft_model, args, total_steps)
+    # Create optimizer with underlying model (before FSDP wrapping, following Eagle3 pattern)
+    print_on_rank0("Creating optimizer...")
+    optimizer = BF16Optimizer(
+        draft_model,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=total_steps,
+    )
+
+    # Wrap model with FSDP (following Eagle3 configuration)
+    mdlm_model = FSDP(
+        draft_model,
+        use_orig_params=True,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        process_group=dist.group.WORLD,
+    )
+
+    # Create alpha scheduler for MDLM
+    print_on_rank0("Creating alpha scheduler...")
+    alpha_scheduler = make_alpha_scheduler(args.alpha_scheduler)
 
     # Create tracker (REUSE: existing tracking infrastructure)
     tracker = None
     if args.report_to and dist.get_rank() == 0:
-        tracker = create_tracker(args)
+        tracker = create_tracker(args, args.output_dir)
 
-    # Training loop
+    # Training loop (following Eagle3 exact pattern)
     print_on_rank0("Starting training...")
+    global_step = 0
+
+    # Metrics tracking
+    metrics = MDLMMetrics()
+
     for epoch in range(args.num_epochs):
         print_on_rank0(f"Epoch {epoch + 1}/{args.num_epochs}")
 
-        # Train epoch
-        train_loss = train_epoch(trainer, train_dataloader, epoch, args, tracker)
+        # Set model to training mode
+        mdlm_model.train()
+        metrics.reset()
+
+        # Create progress bar
+        if dist.get_rank() == 0:
+            progress_bar = tqdm(
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+            )
+        else:
+            progress_bar = train_dataloader
+
+        # Main training loop (exactly like Eagle3)
+        for data in progress_bar:
+            global_step += 1
+
+            # Move batch to device
+            for key in data:
+                if isinstance(data[key], torch.Tensor):
+                    data[key] = data[key].cuda()
+
+            # ================================================
+            # Training Step (following Eagle3 pattern exactly)
+            # ================================================
+            loss, step_metrics = run_mdlm_forward(args, mdlm_model, data, alpha_scheduler)
+            run_mdlm_backward_and_update(args, loss, optimizer, global_step)
+
+            # Update metrics
+            metrics.update(step_metrics)
+
+            # Logging
+            if global_step % (args.log_interval * args.gradient_accumulation_steps) == 0:
+                current_metrics = metrics.compute()
+                lr = optimizer.scheduler.get_last_lr()[0]
+
+                if dist.get_rank() == 0:
+                    progress_bar.set_postfix({
+                        'loss': f"{current_metrics['loss']:.4f}",
+                        'ppl': f"{current_metrics['ppl']:.2f}",
+                        'mask_ratio': f"{current_metrics['mask_ratio']:.3f}",
+                        'lr': f"{lr:.2e}",
+                    })
+
+                if tracker and dist.get_rank() == 0:
+                    log_data = {
+                        'train/loss': current_metrics['loss'],
+                        'train/nll': current_metrics['nll'],
+                        'train/ppl': current_metrics['ppl'],
+                        'train/mask_ratio': current_metrics['mask_ratio'],
+                        'train/avg_timestep': current_metrics['avg_timestep'],
+                        'train/accuracy': current_metrics['accuracy'],
+                        'train/lr': lr,
+                        'train/step': global_step,
+                        'train/epoch': epoch,
+                    }
+                    tracker.log(log_data)
+
+            # Save checkpoint
+            if global_step % (args.save_interval * args.gradient_accumulation_steps) == 0:
+                save_checkpoint(mdlm_model, optimizer, epoch, global_step, args)
 
         # Evaluate if eval dataloader exists
         if eval_dataloader is not None:
-            eval_metrics = evaluate(trainer, eval_dataloader, epoch, tracker)
+            eval_metrics = evaluate(args, mdlm_model, alpha_scheduler, eval_dataloader, epoch, tracker)
 
         # Save checkpoint at end of epoch
-        save_checkpoint(trainer, epoch, trainer.step, args)
+        save_checkpoint(mdlm_model, optimizer, epoch, global_step, args)
 
-        print_on_rank0(f"Epoch {epoch + 1} completed. Train loss: {train_loss:.4f}")
+        # Compute epoch metrics
+        epoch_metrics = metrics.compute()
+        print_on_rank0(f"Epoch {epoch + 1} completed. Train loss: {epoch_metrics['loss']:.4f}")
 
     print_on_rank0("Training completed!")
 
