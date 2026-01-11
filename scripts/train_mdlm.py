@@ -835,16 +835,6 @@ def main():
     # Calculate total training steps
     total_steps = len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps
 
-    # Create optimizer with underlying model (before FSDP wrapping, following Eagle3 pattern)
-    print_on_rank0("Creating optimizer...")
-    optimizer = BF16Optimizer(
-        draft_model,
-        lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=total_steps,
-    )
-
     # Wrap model with FSDP (following Eagle3 configuration)
     mdlm_model = FSDP(
         draft_model,
@@ -855,6 +845,16 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,
+    )
+
+    # Create optimizer with underlying model (after FSDP wrapping, following Eagle3 pattern)
+    print_on_rank0("Creating optimizer...")
+    optimizer = BF16Optimizer(
+        draft_model,
+        lr=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        warmup_ratio=args.warmup_ratio,
+        total_steps=total_steps,
     )
 
     # Create alpha scheduler for MDLM
