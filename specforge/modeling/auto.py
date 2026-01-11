@@ -19,7 +19,6 @@ from transformers import (
 )
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .draft.llama_mdlm import LlamaMDLMDraftModel
 from .draft.qwen3_mdlm import Qwen3MDLMDraftModel
 from .target.custom_backend import (
     GptOssForCausalLM,
@@ -43,7 +42,6 @@ class AutoMDLMDraftModel(AutoModelForCausalLMBase):
     """Auto model factory for MDLM draft models."""
 
     _model_mapping = {
-        LlamaConfig: LlamaMDLMDraftModel,
         Qwen3Config: Qwen3MDLMDraftModel,  # Use proper Qwen3 MDLM implementation
     }
 
