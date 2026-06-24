@@ -239,6 +239,7 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        shared_kv_states: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[
         List[torch.Tensor],
@@ -332,6 +333,8 @@ class OnlineEagle3Model(Eagle3Model):
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
+        is_gemma4_mtp = shared_kv_states is not None
+
         for idx in range(self.length):
             state = adapter.step_view(
                 idx=idx,
@@ -354,21 +357,32 @@ class OnlineEagle3Model(Eagle3Model):
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
-            hidden_states_out = self.draft_model.backbone(
-                input_embeds=inputs_embeds,
-                hidden_states=state.hidden_states,
-                cache_hidden=cache_hidden,
-                attention_mask=state.attention_mask,
-                position_ids=state.position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
+            if is_gemma4_mtp:
+                # Gemma4 MTP: backbone returns (projected_hidden, logits) tuple
+                # shared_kv_states is reused across all TTT steps (fixed from target)
+                backbone_out = self.draft_model.backbone(
+                    input_embeds=inputs_embeds,
+                    hidden_states=state.hidden_states,
+                    cache_hidden=None,
+                    attention_mask=state.attention_mask,
+                    position_ids=state.position_ids,
+                    shared_kv_states=shared_kv_states,
+                )
+                hidden_states_out, logits = backbone_out
+            else:
+                hidden_states_out = self.draft_model.backbone(
+                    input_embeds=inputs_embeds,
+                    hidden_states=state.hidden_states,
+                    cache_hidden=cache_hidden,
+                    attention_mask=state.attention_mask,
+                    position_ids=state.position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                logits = self.draft_model.compute_logits(hidden_states_out)
 
             # update hidden states for next step
             hidden_states = hidden_states_out
-
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 5.5 + 5.6: metric and loss
             (

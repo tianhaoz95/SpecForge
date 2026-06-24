@@ -126,7 +126,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--target-model-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "hf", "custom"],
+        choices=["sglang", "hf", "custom", "gemma4_mtp"],
         help="The backend of the target model",
     )
 
@@ -707,6 +707,7 @@ def run_forward(
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                 )
+                shared_kv_states = None
             else:
                 eagle3_data = target_model.generate_eagle3_data(
                     input_ids=data["input_ids"].cuda(),
@@ -730,8 +731,10 @@ def run_forward(
             hidden_states = get_dp_data_shard_from_tp(
                 eagle3_data.hidden_states, args.shard_target_output
             )
+            shared_kv_states = getattr(eagle3_data, "shared_kv_states", None)
         else:
             # we generate the logits using the hidden states loaded from disk
+            shared_kv_states = None
             attention_mask = data["attention_mask"].cuda()
             hidden_states = data["hidden_state"].cuda()
             input_ids, target, loss_mask = target_model.preprocess(
@@ -761,6 +764,7 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
+            shared_kv_states=shared_kv_states,
         )
     return (
         plosses,

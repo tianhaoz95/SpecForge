@@ -29,11 +29,21 @@ from .target.custom_backend import (
     Qwen3MoeForCausalLM,
 )
 
+try:
+    from transformers import Gemma4AssistantConfig
+
+    from .draft.gemma4_mtp import Gemma4MTPDraftModel
+
+    _GEMMA4_ASSISTANT_AVAILABLE = True
+except ImportError:
+    _GEMMA4_ASSISTANT_AVAILABLE = False
+
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
+        **({Gemma4AssistantConfig: Gemma4MTPDraftModel} if _GEMMA4_ASSISTANT_AVAILABLE else {}),
     }
 
     @classmethod
@@ -133,6 +143,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        **({"Gemma4AssistantForCausalLM": Gemma4AssistantConfig} if _GEMMA4_ASSISTANT_AVAILABLE else {}),
     }
 
     @classmethod
@@ -150,11 +161,6 @@ class AutoDraftModelConfig:
         with open(config_path, "r") as f:
             config = json.load(f)
 
-        if "tie_word_embeddings" in config:
-            print("Set draft model tie_word_embeddings to False")
-            config["tie_word_embeddings"] = False
-
-        # check for architectures
         architectures = config.get("architectures", None)
 
         if architectures is None:
@@ -165,11 +171,30 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
+        # Gemma4AssistantForCausalLM uses tie_word_embeddings=False (standalone lm_head)
+        if architecture != "Gemma4AssistantForCausalLM":
+            if "tie_word_embeddings" in config:
+                print("Set draft model tie_word_embeddings to False")
+                config["tie_word_embeddings"] = False
+
         if architecture not in cls._config_mapping:
             raise ValueError(f"Architecture {architecture} not supported")
 
         # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
-            config["draft_vocab_size"] = config.get("vocab_size", None)
+            text = config.get("text_config", {})
+            config["draft_vocab_size"] = text.get("vocab_size", config.get("vocab_size", None))
+
+        if architecture == "Gemma4AssistantForCausalLM":
+            config.pop("draft_vocab_size", None)
+            gemma4_config = Gemma4AssistantConfig(**config)
+            # Expose vocab_size / draft_vocab_size for training script compatibility
+            _vocab = gemma4_config.get_text_config().vocab_size
+            gemma4_config.vocab_size = _vocab
+            gemma4_config.draft_vocab_size = _vocab
+            # These optional attrs are read with getattr; set to safe defaults
+            gemma4_config.target_model_type = "gemma4"
+            gemma4_config.eagle_config = None
+            return gemma4_config
 
         return cls._config_mapping[architecture].from_dict(config)

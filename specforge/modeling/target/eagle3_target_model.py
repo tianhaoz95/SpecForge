@@ -3,41 +3,77 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    init_mm_embedding_cache,
-)
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    Req,
-    ScheduleBatch,
-)
-
-# - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
-from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
+
+try:
+    import sglang.srt.managers.mm_utils as mm_utils
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+        init_mm_embedding_cache,
+    )
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+        Req,
+        ScheduleBatch,
+    )
+    from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+    _SGLANG_AVAILABLE = True
+except Exception:
+    _SGLANG_AVAILABLE = False
+    # Stub types so SGLangEagle3TargetModel class body can be parsed
+    class _Stub:
+        pass
+    mm_utils = _Stub()  # type: ignore
+    ModelConfig = _Stub  # type: ignore
+    MRotaryEmbedding = _Stub  # type: ignore
+    MultiModalityDataPaddingPatternMultimodalTokens = _Stub  # type: ignore
+    init_mm_embedding_cache = lambda *a, **k: None  # type: ignore
+    Modality = _Stub  # type: ignore
+    MultimodalDataItem = _Stub  # type: ignore
+    MultimodalInputs = _Stub  # type: ignore
+    Req = _Stub  # type: ignore
+    ScheduleBatch = _Stub  # type: ignore
+    prepare_mlp_sync_batch_raw = lambda *a, **k: None  # type: ignore
+    CacheInitParams = _Stub  # type: ignore
+    RadixCache = _Stub  # type: ignore
+    CaptureHiddenMode = _Stub  # type: ignore
+    ForwardBatch = _Stub  # type: ignore
+    BaseMultimodalProcessor = _Stub  # type: ignore
+    SamplingParams = _Stub  # type: ignore
+    ServerArgs = _Stub  # type: ignore
+    SpeculativeAlgorithm = _Stub  # type: ignore
+    require_mlp_sync = lambda *a, **k: False  # type: ignore
+    require_mlp_tp_gather = lambda *a, **k: False  # type: ignore
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
-from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
-from .sglang_backend.utils import LogitsProcessorForEAGLE3
+try:
+    from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+    from .sglang_backend.utils import LogitsProcessorForEAGLE3
+except Exception:
+    # Stubs so SGLangEagle3TargetModel class body parses without sglang
+    class SGLangRunner:  # type: ignore[no-redef]
+        pass
+    class LogitsProcessorForEAGLE3:  # type: ignore[no-redef]
+        pass
+    def wrap_eagle3_logits_processors_in_module(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("sglang is not available")
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +86,7 @@ class Eagle3TargetOutput:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     last_hidden_states: Optional[torch.Tensor] = None
+    shared_kv_states: Optional[dict] = None
 
 
 class Eagle3TargetModel(ABC):
@@ -884,6 +921,65 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         )
 
 
+class Gemma4MTPTargetModel(HFEagle3TargetModel):
+    """
+    Target model adapter for Gemma 4 MTP drafter training.
+
+    Calls the target Gemma4ForConditionalGeneration with:
+      - output_hidden_states=True   → captures last_hidden_states for draft input
+      - return_shared_kv_states=True → captures shared_kv_states for cross-attention
+
+    Does NOT use the 3-layer aux_hidden_states concatenation from EAGLE-3.
+    """
+
+    @torch.no_grad()
+    def generate_eagle3_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        **kwargs,
+    ) -> Eagle3TargetOutput:
+        if kwargs:
+            logger.debug(f"unused kwargs {list(kwargs.keys())}")
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+            return_shared_kv_states=True,
+        )
+
+        shared_kv_states = outputs.shared_kv_states
+        if shared_kv_states is None:
+            raise RuntimeError(
+                "Target model did not return shared_kv_states. "
+                "Ensure the target is Gemma4ForConditionalGeneration from transformers>=5.8.0."
+            )
+
+        last_hidden_states = outputs.hidden_states[-1]
+
+        target = outputs.logits
+        target = padding(target, left=False)
+        input_ids = padding(input_ids, left=False)
+        loss_mask = loss_mask[..., None].to(target.device)
+
+        return Eagle3TargetOutput(
+            hidden_states=last_hidden_states,
+            target=target,
+            loss_mask=loss_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            last_hidden_states=last_hidden_states,
+            shared_kv_states=shared_kv_states,
+        )
+
+    def set_aux_hidden_states_layers(self, aux_hidden_states_layers=None):
+        pass
+
+
 def get_eagle3_target_model(
     pretrained_model_name_or_path: str,
     backend: str = "sglang",
@@ -910,6 +1006,14 @@ def get_eagle3_target_model(
         )
     elif backend == "custom":
         return CustomEagle3TargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "gemma4_mtp":
+        return Gemma4MTPTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
